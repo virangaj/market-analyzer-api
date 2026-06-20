@@ -42,7 +42,7 @@ no order placement anywhere in the codebase.
 
 ```bash
 pip install -r requirements.txt
-uvicorn gold_analyzer.api:app --reload --port 8000
+uvicorn api:app --reload --port 8000
 # open http://localhost:8000/docs  to try the endpoints
 ```
 
