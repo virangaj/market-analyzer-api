@@ -1,93 +1,189 @@
-# Gold (PAXG) Market Analyzer
+# market-analyzer
 
-Analysis & alerts engine for trading **PAX Gold (PAXG)** on Binance. PAXG is
-tokenized physical gold — so it behaves like a gold tracker (driven by the US
-dollar / DXY, real yields, rate expectations, geopolitics) *and* a crypto asset
-(its own order-book liquidity, BTC correlation, and a premium/discount vs. spot
-gold that is itself a signal).
+Market-analysis engine for trading gold tokens (**PAXG**, **XAUT**) and any
+other pair on **MEXC**, across both **spot** and **futures**. It computes a
+technical signal, suggests a risk-defined entry bracket, and validates the same
+logic with a backtester.
 
-This repo is the **research-now / live-later** backend. It is **analysis-only** —
-no order placement anywhere in the codebase.
+- **market-analyzer-api** — FastAPI backend (this repo)
+- **market-analyzer-dashboard** — React + TypeScript frontend (separate repo)
+
+> **Analysis & alerts only — no order placement anywhere in the codebase.**
+> Not financial advice; every signal is a probabilistic edge at best, and the
+> entry/stop/target levels are risk management, not predictions.
+
+---
+
+## Flow
+
+```mermaid
+flowchart TD
+    A[Symbol + market<br/>spot or futures] --> B[Fetch klines · MEXC]
+    B --> C[Enrich indicators<br/>8 incl. ADX, RVOL]
+    M[Macro / news context<br/>neutral until wired] --> D
+    C --> D[Composite score + regime<br/>7 weighted components]
+    D --> E{Decision gate<br/>hysteresis · asymmetric · regime}
+    E -->|neutral| H[HOLD — no trade]
+    E -->|long / short| F[Build bracket<br/>dynamic stop · R-targets · size]
+    F --> G1[Live dashboard]
+    F --> G2[Backtester<br/>validates same rules]
+```
+
+One spine, a single branch (trade vs. hold), one fork (live vs. backtest).
+Every failure mode — bad symbol, missing ATR, weak signal, choppy market — is a
+place where the flow **stops or holds** rather than forcing a trade through.
+
+---
 
 ## Architecture
 
 ```
-                 ┌────────────────────────────────────────────┐
-   Binance REST  │  binance_client.py   (OHLCV + ticker)        │
-   (public)      └───────────────┬──────────────────────────────┘
-                                 ▼
-                    indicators.py   EMA/SMA · RSI · MACD · Bollinger
-                                    ATR · Supertrend  (TradingView math)
-                                 │
-                 ┌───────────────┴───────────────┐
-                 ▼                                ▼
-          patterns.py                     context_providers.py
-       candlestick context              macro (DXY, PAXG-vs-spot premium)
-                 │                       news  (Claude-scored headlines)
-                 └───────────────┬───────────────┘
-                                 ▼
-                         signal_engine.py
-                 weighted blend → score [-100..100] + confidence
-                                 │
-                 ┌───────────────┴───────────────┐
-                 ▼                                ▼
-            backtest.py                        api.py  (FastAPI)
-       walk-forward, no look-ahead     /candles /analyze /backtest
-                                                 │
-                                                 ▼
-                                       React dashboard (separate file)
+   MEXC spot  ──► market_data.py ─┐
+   MEXC futures ► futures_data.py ┤  (+ Binance, for the price cross-check)
+                                  ▼
+                            indicators.py   EMA · RSI · MACD · Bollinger · ATR
+                                            Supertrend · ADX · RVOL
+                                  │
+                  ┌───────────────┼───────────────┐
+                  ▼               ▼                ▼
+            patterns.py    signal_engine.py   context_providers.py
+          candlestick      weighted blend →   macro (DXY/premium)
+          patterns         score [-100..100]  news (Claude-scored)
+                                  │
+                                  ▼
+                            strategy.py   StrategyConfig + decide()
+                          (hysteresis · asymmetric · regime — shared by both)
+                                  │
+                  ┌───────────────┴───────────────┐
+                  ▼                                ▼
+             entries.py                       backtest.py
+        entry/stop/targets/size          walk-forward, real bracket
+                  └───────────────┬───────────────┘
+                                  ▼
+                              api.py  (FastAPI)
+                /candles /analyze /entry /backtest /symbols /sanity
 ```
+
+| Module | Responsibility |
+|---|---|
+| `market_data.py` | MEXC **spot** client (+ Binance for cross-check). Env `MARKET_BASE_URL`. |
+| `futures_data.py` | MEXC **futures** (contract) client. Env `FUTURES_BASE_URL`. |
+| `indicators.py` | `enrich()` — attaches all 8 indicators. |
+| `patterns.py` | Candlestick pattern detection. |
+| `signal_engine.py` | `analyze()` — blends components into the composite score. |
+| `strategy.py` | **`StrategyConfig` + `decide()`** — shared trade logic. |
+| `entries.py` | `suggest()` — entry/stop/target/size bracket. |
+| `backtest.py` | `run()` — event-driven backtest of the real bracket. |
+| `context_providers.py` | Macro (DXY/premium) + news (Claude-scored) feeds. |
+| `api.py` | FastAPI endpoints. |
+| `main.py` | Entry point for deployment (binds `$PORT`). |
+
+---
 
 ## Run
 
 ```bash
 pip install -r requirements.txt
-uvicorn api:app --reload --port 8000
-# open http://localhost:8000/docs  to try the endpoints
+uvicorn api:app --reload --port 8000     # or: python main.py
+# open http://localhost:8000/docs
 ```
 
-Then point the dashboard's API base at `http://localhost:8000`.
+Deploy to Render: see **`DEPLOY.md`** (use a non-US region — MEXC and Binance
+geo-restrict US IPs).
 
-> Note: Binance market-data endpoints are geo-restricted in some regions. If
-> `/candles` errors, route the host through a permitted region or swap the base
-> URL in `binance_client.py` to `api.binance.us` / a mirror.
+---
 
-## The signal
+## Indicators (`indicators.enrich`)
 
-Each component emits a sub-score in `[-1, 1]`; the weighted blend scales to
-`[-100, 100]`. Defaults (`signal_engine.Weights`):
+| Indicator | Params | Measures |
+|---|---|---|
+| EMA fast / slow | 21 / 55 | Trend direction |
+| RSI | 14 (Wilder) | Momentum |
+| MACD | 12 / 26 / 9 | Momentum acceleration |
+| Bollinger Bands | 20, 2σ (population) | Volatility / mean-reversion |
+| ATR | 14 (Wilder) | Volatility → stop distance & sizing |
+| Supertrend | 10, ×3 | Trend confirmation |
+| ADX | 14 | **Trend strength → regime** |
+| RVOL | 20 | **Relative volume → dynamic stop** |
 
-| component   | weight | source |
-|-------------|:------:|--------|
-| trend       | 0.30 | EMA21 vs EMA55, price vs slow EMA |
-| momentum    | 0.25 | RSI(14) centered, MACD histogram |
-| volatility  | 0.10 | position within Bollinger band |
-| supertrend  | 0.10 | ATR Supertrend direction |
-| candles     | 0.10 | engulfing / hammer / star patterns |
-| macro       | 0.10 | DXY direction + PAXG-vs-spot premium |
-| news        | 0.05 | Claude-scored headline sentiment |
+TradingView-faithful math (Wilder RMA, population stdev, recursive EMA).
 
-Tune the weights to taste — they're a constructor argument, not hardcoded.
+---
 
-## Where to extend (the seams are already cut)
+## The signal (`signal_engine.analyze`)
 
-- **Live mode** — add a Binance WebSocket kline stream and call
-  `signal_engine.analyze` on each closed bar; push to the dashboard over SSE/WS.
-- **News** — `context_providers.news_context(headlines)` already scores
-  headlines with Claude (`claude-sonnet-4-6`). Set `ANTHROPIC_API_KEY` and feed
-  it your own headline source (NewsAPI, RSS, a macro calendar).
-- **Macro** — fill in `context_providers.macro_context`: a DXY feed (gold is
-  inversely correlated) and a spot XAU/USD feed to compute the PAXG premium.
-- **Alerts** — when `analyze().score` crosses a threshold, fire Telegram/email.
-  (You've built a Telegram signals bot before — same pattern.)
-- **Trade execution** — deliberately absent. If you ever add it, put it behind a
-  separate, explicitly-keyed module so research code can never send an order.
+Each component emits a signed sub-score in `[-1, 1]`; the weighted blend scales
+to `[-100, 100]`.
+
+| Component | Weight | Source |
+|---|:---:|---|
+| trend | 0.30 | EMA21 vs EMA55, price vs slow EMA |
+| momentum | 0.25 | RSI(14) centered, MACD histogram |
+| volatility | 0.10 | position within Bollinger band |
+| supertrend | 0.10 | ATR Supertrend direction |
+| candles | 0.10 | engulfing / hammer / star patterns |
+| macro | 0.10 | DXY + PAXG-vs-spot premium *(neutral until wired)* |
+| news | 0.05 | Claude-scored headline sentiment *(neutral until wired)* |
+
+**Label:** `≥40` Strong Bullish · `≥15` Bullish · `−15…+15` Neutral · `≤−40`
+Strong Bearish. **Confidence** = component agreement.
+
+---
+
+## Decision & bracket
+
+The score passes through a two-gate decision (`strategy.decide`):
+
+- **Hysteresis** — enter long at `+15`, hold until the score falls below `+5`
+  (no border whiplash).
+- **Asymmetric** — longs at `+15`, shorts at `−25` (shorts need more confluence).
+- **Regime** — ADX < 20 ⇒ ranging ⇒ entry threshold ×1.6 (don't buy the top in chop).
+- **Hard ATR guardrail** — no ATR ⇒ no trade.
+
+A valid long/short builds the bracket (`entries.suggest`): entry = close,
+stop = `k×ATR` (`1.5`, or `2.5` on an RVOL spike), targets at `1R/2R/3R`, and a
+position size from your account + risk % so the dollar risk is fixed. Tuning
+knobs live in `strategy.StrategyConfig` — defaults are starting points, not
+optimized values.
+
+---
+
+## API
+
+Base `http://localhost:8000` · docs at `/docs`. Common params: `symbol`,
+`interval`, `market` (`spot`|`futures`).
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /candles` | OHLCV + indicators for charting |
+| `GET /analyze` | Current composite signal |
+| `GET /entry` | Entry/stop/target bracket + sizing (`account`, `risk_pct`) |
+| `GET /backtest` | Walk-forward backtest metrics + equity curve |
+| `GET /symbols` | Full tradable catalog (autocomplete) |
+| `GET /sanity` | Price cross-check vs Binance |
+| `GET /health` | Liveness |
+
+---
+
+## Where to extend (seams already cut)
+
+- **Macro** — fill in `context_providers.macro_context`: a DXY feed and a spot
+  XAU/USD feed for the PAXG premium (highest-value for gold).
+- **News** — `context_providers.news_context(headlines)` scores headlines with
+  Claude; set `ANTHROPIC_API_KEY` and feed it a headline source.
+- **Live mode** — a MEXC WebSocket kline stream calling `signal_engine.analyze`
+  on each closed bar, pushed to the dashboard over SSE/WS.
+- **Alerts** — fire Telegram/email when `analyze().score` crosses a threshold.
+- **Trade execution** — deliberately absent; keep it behind a separate,
+  explicitly-keyed module if ever added.
+
+---
 
 ## Honest limits
 
-Every layer is a *probabilistic edge at best*. TA and candlestick patterns
-describe tendencies, not certainties; news sentiment is noisy and often already
-priced in. Backtest results overstate live performance (no slippage model,
-single asset, in-sample tuning risk). This is a tool to structure your own
-decisions — not financial advice, and not a recommendation engine. Risk and
-position sizing matter more than signal quality.
+Every layer is a probabilistic edge at best. Default weights/thresholds are
+**un-optimized** — validate per pair in the backtester. The regime filter is
+conservative (raises the bar in a range rather than trading the range). TA on
+thin MEXC alts is noisy — use the Binance cross-check to gauge data quality.
+Backtests overstate live results (no slippage, single asset, in-sample risk).
+This structures your decisions; it does not replace judgment.
