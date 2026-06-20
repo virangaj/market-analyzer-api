@@ -12,6 +12,7 @@ Run:  uvicorn gold_analyzer.api:app --reload --port 8000
 from __future__ import annotations
 
 import math
+import os
 
 import requests
 from fastapi import FastAPI, Query, HTTPException
@@ -21,17 +22,21 @@ import market_data as bc
 import futures_data as fut
 import indicators, signal_engine, backtest, context_providers, entries, strategy
 
-app = FastAPI(title="Gold (PAXG) Analyzer", version="0.1.0")
+app = FastAPI(title="market-analyzer-api", version="0.1.0")
 
 
 def _source(market: str):
     """Pick the data client: 'futures' -> MEXC contract, else MEXC spot."""
     return fut if market == "futures" else bc
 
-# allow the React dev server to call us during development
+
+# CORS origins: comma-separated ALLOWED_ORIGINS env var, or "*" for any.
+# Defaults to the local Vite/CRA dev servers.
+_origins_env = os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000")
+_allow_origins = ["*"] if _origins_env.strip() == "*" else [o.strip() for o in _origins_env.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=_allow_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

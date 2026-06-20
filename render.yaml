@@ -1,0 +1,27 @@
+# Render Blueprint — deploys the FastAPI backend as a web service.
+# Commit this at the repo root and use Render's "New > Blueprint" flow,
+# or just configure the same settings manually in the dashboard.
+services:
+  - type: web
+    name: market-analyzer-api
+    runtime: python
+    # Use a NON-US region: MEXC and Binance both geo-restrict US IPs, so a US
+    # region will break /sanity (Binance) and may break MEXC data calls.
+    region: frankfurt          # or: singapore
+    plan: free                 # note: free web services cold-start after ~15 min idle
+    rootDir: Backend           # the folder containing api.py / main.py — adjust to your repo
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: ALLOWED_ORIGINS
+        # set this to your deployed frontend origin once you have it,
+        # e.g. https://market-analyzer-dashboard.onrender.com  (or "*" while testing)
+        value: "*"
+      - key: PYTHON_VERSION
+        value: "3.12.3"
+      # Optional source overrides (defaults already point at MEXC):
+      # - key: MARKET_BASE_URL
+      #   value: https://api.mexc.com
+      # - key: FUTURES_BASE_URL
+      #   value: https://contract.mexc.com
