@@ -2,8 +2,8 @@
 
 Market-analysis engine for trading gold tokens (**PAXG**, **XAUT**) and any
 other pair on **MEXC**, across both **spot** and **futures**. It computes a
-technical signal, suggests a risk-defined entry bracket, and validates the same
-logic with a backtester.
+technical signal, blends it across timeframes, suggests a risk-defined entry
+bracket, and validates the same logic with a backtester.
 
 - **market-analyzer-api** — FastAPI backend (this repo)
 - **market-analyzer-dashboard** — React + TypeScript frontend (separate repo)
@@ -27,6 +27,7 @@ flowchart TD
     E -->|long / short| F[Build bracket<br/>dynamic stop · R-targets · size]
     F --> G1[Live dashboard]
     F --> G2[Backtester<br/>validates same rules]
+    C -.per timeframe.-> T[Multi-timeframe confluence<br/>combined + alignment]
 ```
 
 One spine, a single branch (trade vs. hold), one fork (live vs. backtest).
@@ -54,14 +55,15 @@ place where the flow **stops or holds** rather than forcing a trade through.
                             strategy.py   StrategyConfig + decide()
                           (hysteresis · asymmetric · regime — shared by both)
                                   │
-                  ┌───────────────┴───────────────┐
-                  ▼                                ▼
-             entries.py                       backtest.py
-        entry/stop/targets/size          walk-forward, real bracket
+                  ┌───────────────┼───────────────┐
+                  ▼               ▼                ▼
+             entries.py       backtest.py       mtf.py
+        entry/stop/target  walk-forward,     multi-timeframe
+        /size bracket      real bracket      confluence
                   └───────────────┬───────────────┘
                                   ▼
-                              api.py  (FastAPI)
-                /candles /analyze /entry /backtest /symbols /sanity
+                              api.py  (FastAPI) · main.py (deploy entry)
+       /candles /analyze /analyze_mtf /entry /backtest /symbols /sanity
 ```
 
 | Module | Responsibility |
@@ -74,7 +76,8 @@ place where the flow **stops or holds** rather than forcing a trade through.
 | `strategy.py` | **`StrategyConfig` + `decide()`** — shared trade logic. |
 | `entries.py` | `suggest()` — entry/stop/target/size bracket. |
 | `backtest.py` | `run()` — event-driven backtest of the real bracket. |
-| `context_providers.py` | Macro (DXY/premium) + news (Claude-scored) feeds. |
+| `mtf.py` | `analyze_mtf()` — multi-timeframe confluence. |
+| `context_providers.py` | Macro + news (Claude-scored) feeds. |
 | `api.py` | FastAPI endpoints. |
 | `main.py` | Entry point for deployment (binds `$PORT`). |
 
@@ -134,8 +137,7 @@ Strong Bearish. **Confidence** = component agreement.
 
 The score passes through a two-gate decision (`strategy.decide`):
 
-- **Hysteresis** — enter long at `+15`, hold until the score falls below `+5`
-  (no border whiplash).
+- **Hysteresis** — enter long at `+15`, hold until the score falls below `+5`.
 - **Asymmetric** — longs at `+15`, shorts at `−25` (shorts need more confluence).
 - **Regime** — ADX < 20 ⇒ ranging ⇒ entry threshold ×1.6 (don't buy the top in chop).
 - **Hard ATR guardrail** — no ATR ⇒ no trade.
@@ -148,6 +150,17 @@ optimized values.
 
 ---
 
+## Multi-timeframe confluence (`mtf.analyze_mtf`)
+
+Scores the signal on **15m / 1h / 4h / 1d** and combines them, weighting higher
+timeframes more (1d 0.35, 4h 0.30, 1h 0.25, 15m 0.15). Returns a per-timeframe
+breakdown, a combined score, and an **alignment %** — the real conviction
+metric. High alignment means the timeframes agree; low alignment means they
+conflict (low-conviction setup). One `/analyze_mtf` request fans out to the four
+timeframes server-side.
+
+---
+
 ## API
 
 Base `http://localhost:8000` · docs at `/docs`. Common params: `symbol`,
@@ -156,12 +169,23 @@ Base `http://localhost:8000` · docs at `/docs`. Common params: `symbol`,
 | Endpoint | Purpose |
 |---|---|
 | `GET /candles` | OHLCV + indicators for charting |
-| `GET /analyze` | Current composite signal |
+| `GET /analyze` | Composite signal (single timeframe) |
+| `GET /analyze_mtf` | Multi-timeframe confluence (combined + alignment) |
 | `GET /entry` | Entry/stop/target bracket + sizing (`account`, `risk_pct`) |
 | `GET /backtest` | Walk-forward backtest metrics + equity curve |
 | `GET /symbols` | Full tradable catalog (autocomplete) |
 | `GET /sanity` | Price cross-check vs Binance |
 | `GET /health` | Liveness |
+
+---
+
+## Dashboard
+
+Futures/spot toggle (**defaults to futures**), symbol autocomplete, a timeframe
+selector (**5m / 15m / 1h / 4h / 1d / ALL** — `ALL` surfaces the multi-timeframe
+panel at the top), the bias gauge, the entry panel (sizing + regime chip), the
+backtest panel, the Binance cross-check toggle, and a **mobile-responsive**
+layout. The default API URL comes from `VITE_API_BASE`.
 
 ---
 
@@ -174,6 +198,8 @@ Base `http://localhost:8000` · docs at `/docs`. Common params: `symbol`,
 - **Live mode** — a MEXC WebSocket kline stream calling `signal_engine.analyze`
   on each closed bar, pushed to the dashboard over SSE/WS.
 - **Alerts** — fire Telegram/email when `analyze().score` crosses a threshold.
+- **MTF veto** — optionally block a trade when the top timeframe disagrees
+  (currently the conflict is surfaced via alignment, not hard-blocked).
 - **Trade execution** — deliberately absent; keep it behind a separate,
   explicitly-keyed module if ever added.
 

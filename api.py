@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import market_data as bc
 import futures_data as fut
-import indicators, signal_engine, backtest, context_providers, entries, strategy
+import indicators, signal_engine, backtest, context_providers, entries, strategy, mtf
 
 app = FastAPI(title="market-analyzer-api", version="0.1.0")
 
@@ -154,6 +154,15 @@ def analyze(symbol: str = "PAXGUSDT", interval: str = "1h", use_news: bool = Fal
     result = signal_engine.analyze(df, context=ctx)
     result["symbol"] = symbol
     result["interval"] = interval
+    result["market"] = market
+    return result
+
+
+@app.get("/analyze_mtf")
+def analyze_mtf(symbol: str = "PAXGUSDT", market: str = "spot", timeframes: str | None = None):
+    """Multi-timeframe confluence: score the signal across timeframes and combine."""
+    tfs = [t.strip() for t in timeframes.split(",") if t.strip()] if timeframes else None
+    result = mtf.analyze_mtf(_source(market).get_klines, symbol, tfs)
     result["market"] = market
     return result
 

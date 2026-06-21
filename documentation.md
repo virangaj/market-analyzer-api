@@ -1,9 +1,13 @@
-# Gold / Crypto Market Analyzer — Documentation
+# market-analyzer — Documentation
 
 A market-analysis tool for trading gold tokens (PAXG, XAUT) and any other pair
 on **MEXC**, across both **spot** and **futures**. It computes a technical
-signal, suggests a risk-defined entry bracket, and validates the same logic
-with a backtester. **Analysis & alerts only — it never places orders.**
+signal, blends it across timeframes, suggests a risk-defined entry bracket, and
+validates the same logic with a backtester. **Analysis & alerts only — it never
+places orders.**
+
+- **market-analyzer-api** — Python + FastAPI backend
+- **market-analyzer-dashboard** — React + TypeScript (Vite) frontend
 
 > Not financial advice. Every signal is a probabilistic edge at best; the
 > entry/stop/target levels are risk management, not predictions.
@@ -15,8 +19,9 @@ with a backtester. **Analysis & alerts only — it never places orders.**
 Pick a symbol and market → it pulls candles from MEXC → computes 8 indicators →
 blends them into a single **bias score (−100…+100)** → a decision gate turns
 that score into **long / short / hold** → if it's a trade, it builds an
-**entry + stop + targets + position size** → the same rules are replayed over
-history by the **backtester**.
+**entry + stop + targets + position size**. Separately, it scores the signal
+across **multiple timeframes** and reports their **alignment**, and replays the
+same rules over history with the **backtester**.
 
 ---
 
@@ -33,6 +38,7 @@ flowchart TD
     E -->|long / short| F[Build bracket<br/>dynamic stop · R-targets · size]
     F --> G1[Live dashboard]
     F --> G2[Backtester<br/>validates same rules]
+    C -.repeat per timeframe.-> T[Multi-timeframe confluence<br/>15m · 1h · 4h · 1d → combined + alignment]
 ```
 
 The shape matters: it's one spine with a single branch (trade vs. hold) and one
@@ -49,16 +55,18 @@ rather than forcing a trade through.
 
 | Module | Responsibility |
 |---|---|
-| `market_data.py` | MEXC **spot** client (+ Binance for cross-check). Switch base via `MARKET_BASE_URL`. |
-| `futures_data.py` | MEXC **futures** (contract) client. Switch base via `FUTURES_BASE_URL`. |
+| `market_data.py` | MEXC **spot** client (+ Binance for cross-check). Env `MARKET_BASE_URL`. |
+| `futures_data.py` | MEXC **futures** (contract) client. Env `FUTURES_BASE_URL`. |
 | `indicators.py` | `enrich()` — attaches all 8 indicators to the candle frame. |
 | `patterns.py` | Candlestick pattern detection. |
 | `signal_engine.py` | `analyze()` — blends components into the composite score. |
-| `strategy.py` | **`StrategyConfig` + `decide()`** — the shared trade logic (hysteresis, asymmetry, regime). |
+| `strategy.py` | **`StrategyConfig` + `decide()`** — shared trade logic (hysteresis, asymmetry, regime). |
 | `entries.py` | `suggest()` — builds the entry/stop/target/size bracket. |
 | `backtest.py` | `run()` — event-driven backtest of the real bracket. |
+| `mtf.py` | `analyze_mtf()` — multi-timeframe confluence. |
 | `context_providers.py` | Macro (DXY/premium) + news (Claude-scored) feeds. |
 | `api.py` | FastAPI endpoints. |
+| `main.py` | Deployment entry point (binds `$PORT`). |
 
 > `strategy.py` is the key design choice: live trading and backtesting both read
 > from one config, so they can never silently diverge.
@@ -99,8 +107,7 @@ scaled to `[-100, +100]`.
 | News | 0.05 | Claude-scored headline sentiment *(neutral until wired)* |
 
 **Label:** `≥40` Strong Bullish · `≥15` Bullish · `−15…+15` Neutral · `≤−40`
-Strong Bearish (Bearish between). **Confidence** = component agreement (high when
-they point the same way, low when they conflict).
+Strong Bearish (Bearish between). **Confidence** = component agreement.
 
 ---
 
@@ -122,13 +129,12 @@ flowchart TD
 Three rules stack on the gate:
 
 - **Hysteresis** — enter long at `+15`, but don't drop to HOLD until the score
-  falls below `+5`. Stops the system from flip-flopping on border noise.
+  falls below `+5`. Stops flip-flopping on border noise.
 - **Asymmetric thresholds** — longs at `+15`, shorts at `−25` (shorts demand
   more confluence). Configurable, not hardcoded.
 - **Regime gate** — when ADX < 20 the market is "ranging" and the entry
   threshold is raised ×1.6 (≈ 24), so it won't buy a local top in chop.
-- **Hard ATR guardrail** — no ATR ⇒ no trade (a direction without an
-  invalidation price is forbidden).
+- **Hard ATR guardrail** — no ATR ⇒ no trade.
 
 ---
 
@@ -147,9 +153,27 @@ For a valid long/short:
 
 ---
 
-## 8. Backtester (`backtest.run`)
+## 8. Multi-timeframe confluence (`mtf.analyze_mtf`)
 
-Replays the **exact live rules** over history (no longer a separate strategy):
+Runs the signal engine across the timeframes traders actually watch and combines
+them, so a 1h long that fights the daily trend is visible.
+
+- **Timeframes:** 15m, 1h, 4h, 1d — higher timeframes weighted more
+  (1d 0.35, 4h 0.30, 1h 0.25, 15m 0.15).
+- **Combined score:** weighted average of the per-timeframe scores.
+- **Alignment %:** how much the timeframes agree (100 = all same direction).
+  This is the real conviction metric — a high combined score with low alignment
+  is a conflicted, low-conviction setup.
+- Resilient per timeframe: one failed timeframe doesn't sink the rest.
+
+The UI makes **one** `/analyze_mtf` request; the per-timeframe loop runs
+server-side (four MEXC fetches close to the exchange, not in the browser).
+
+---
+
+## 9. Backtester (`backtest.run`)
+
+Replays the **exact live rules** over history (not a separate strategy):
 
 - Entries via the same `decide()` (hysteresis / asymmetric / regime).
 - On entry: real ATR stop + `target_R` target.
@@ -162,14 +186,15 @@ Replays the **exact live rules** over history (no longer a separate strategy):
 
 ---
 
-## 9. API endpoints
+## 10. API endpoints
 
 Base: `http://localhost:8000` · interactive docs at `/docs`.
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /candles` | OHLCV + indicators for charting |
-| `GET /analyze` | Current composite signal |
+| `GET /analyze` | Current composite signal (single timeframe) |
+| `GET /analyze_mtf` | Multi-timeframe confluence (combined + alignment) |
 | `GET /entry` | Entry/stop/target bracket + sizing |
 | `GET /backtest` | Walk-forward backtest metrics + equity curve |
 | `GET /symbols` | Full tradable catalog (autocomplete) |
@@ -179,10 +204,11 @@ Base: `http://localhost:8000` · interactive docs at `/docs`.
 Common query params: `symbol`, `interval`, `market` (`spot`\|`futures`).
 `/entry` adds `account`, `risk_pct`. `/backtest` adds `enter_long`,
 `enter_short`, `allow_short`, `target_r`, `fee_bps`.
+`/analyze_mtf` accepts an optional comma-separated `timeframes`.
 
 ---
 
-## 10. Tuning knobs (`strategy.StrategyConfig`)
+## 11. Tuning knobs (`strategy.StrategyConfig`)
 
 | Field | Default | Meaning |
 |---|---:|---|
@@ -202,52 +228,72 @@ Common query params: `symbol`, `interval`, `market` (`spot`\|`futures`).
 
 ---
 
-## 11. Frontend (`src/`)
+## 12. Frontend (`src/`)
 
 | Area | Files |
 |---|---|
-| Core | `types.ts`, `theme.ts`, `lib/format.ts`, `lib/demo.ts` |
+| Core | `types.ts`, `theme.ts`, `lib/format.ts`, `lib/demo.ts`, `lib/useIsMobile.ts` |
 | Data | `api/client.ts` (typed fetch layer) |
-| Components | `Header`, `BiasGauge`, `SignalComponents`, `PriceChart`, `Patterns`, `ContextNotes`, `LiveView`, `SymbolPicker`, `EntryPanel`, `BacktestPanel`, `Stat` |
+| Components | `Header`, `BiasGauge`, `SignalComponents`, `PriceChart`, `Patterns`, `ContextNotes`, `LiveView`, `SymbolPicker`, `EntryPanel`, `MtfPanel`, `BacktestPanel`, `Stat` |
 | Shell | `App.tsx`, `main.tsx` |
 
-Features: spot/futures toggle, symbol autocomplete from the live catalog,
-Live/Research mode, the bias gauge, the entry panel (with sizing inputs and the
-regime chip), and the Binance cross-check toggle.
+Features: **futures/spot toggle (defaults to futures)**, symbol autocomplete
+from the live catalog, a **timeframe selector (5m / 15m / 1h / 4h / 1d / ALL)**,
+Live/Research mode, the bias gauge, the **multi-timeframe confluence panel**
+(surfaced at the top when **ALL** is selected), the entry panel (sizing inputs +
+regime chip), the backtest panel, the Binance cross-check toggle, and a
+**mobile-responsive** layout. The default API URL comes from `VITE_API_BASE`.
 
 ---
 
-## 12. Run it
+## 13. Run it
 
 **Backend**
 ```bash
 pip install -r requirements.txt
-uvicorn api:app --reload --port 8000
+uvicorn api:app --reload --port 8000     # or: python main.py
 # open http://localhost:8000/docs
 ```
 
 **Frontend**
 ```bash
-npm create vite@latest gold-dashboard -- --template react-ts
-cd gold-dashboard && npm install && npm install recharts
+npm create vite@latest market-analyzer-dashboard -- --template react-ts
+cd market-analyzer-dashboard && npm install && npm install recharts
 # drop the src/ files in, then:
 npm run dev   # http://localhost:5173
 ```
 
-Source switching (env vars):
-`MARKET_BASE_URL` (spot, default `https://api.mexc.com`),
-`FUTURES_BASE_URL` (futures, default `https://contract.mexc.com`).
+Source switching (env vars): `MARKET_BASE_URL` (spot, default
+`https://api.mexc.com`), `FUTURES_BASE_URL` (futures, default
+`https://contract.mexc.com`).
 
 ---
 
-## 13. Known limitations
+## 14. Deployment (Render)
+
+Deploy `market-analyzer-api` as a web service and `market-analyzer-dashboard` as
+a static site. Full steps in **`DEPLOY.md`**. Key points:
+
+- **Non-US region** (Frankfurt / Singapore) — MEXC and Binance geo-restrict US
+  IPs, which breaks `/sanity` and may break data calls.
+- Backend: start `python main.py`; set `ALLOWED_ORIGINS` (CORS) to the
+  dashboard URL.
+- Frontend: build `npm install && npm run build`, publish `dist`, set
+  `VITE_API_BASE` to the backend URL.
+- Free-tier web services cold-start after ~15 min idle (30–60s first load).
+
+---
+
+## 15. Known limitations
 
 - Macro and news feeds are **stubbed/neutral** until you wire DXY, the
   PAXG-vs-spot premium, and a headline source.
 - Default config values are **un-optimized** — validate per pair.
 - The regime filter is conservative (it *raises the bar* in a range rather than
   switching to a mean-reversion strategy).
-- TA on thin/low-liquidity MEXC alts is noisy — the signal is only as good as
-  the candles. Use the Binance cross-check to gauge data quality.
+- Multi-timeframe combine surfaces conflict via alignment but does **not**
+  hard-veto a trade when the top timeframe disagrees (it dilutes, not blocks).
+- TA on thin/low-liquidity MEXC alts is noisy — use the Binance cross-check to
+  gauge data quality.
 - Backtests overstate live results (no slippage model, single asset,
   in-sample tuning risk).
